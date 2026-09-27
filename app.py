@@ -7,13 +7,12 @@ from pydantic import BaseModel
 
 from langchain_core.documents import Document
 from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings
 )
 from langchain_chroma import Chroma
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langgraph.prebuilt import create_react_agent
 
 
 # =========================
@@ -24,31 +23,22 @@ app = FastAPI()
 
 
 # =========================
-# API KEY
+# API KEY & MODELS
 # =========================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not GEMINI_API_KEY:
-    # Allow import without crashing if running build steps, but validate at runtime
-    pass
-
-
-# =========================
-# LLM & EMBEDDINGS
-# =========================
-
 def get_llm():
     return ChatGoogleGenerativeAI(
         model="gemini-1.5-flash",
-        api_key=GEMINI_API_KEY or os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("GEMINI_API_KEY"),
         temperature=0.3
     )
 
 def get_embeddings():
     return GoogleGenerativeAIEmbeddings(
         model="models/text-embedding-004",
-        google_api_key=GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+        google_api_key=os.getenv("GEMINI_API_KEY")
     )
 
 
@@ -170,11 +160,10 @@ tools = [search_schedule, add_event, delete_event]
 # AGENT SETUP
 # =========================
 
-def get_agent_executor():
-    llm = get_llm()
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", f"""You are an intelligent RAG Schedule Agent.
+def get_agent():
+    system_prompt = f"""You are an intelligent RAG Schedule Agent.
 Today's date is {today}.
+
 Your responsibilities:
 - Answer questions about the user's schedule.
 - Search events using search_schedule.
@@ -183,15 +172,15 @@ Your responsibilities:
 
 Important rules:
 - Never invent schedule information.
+- Use search_schedule when the user asks about existing events.
 - Keep answers clear and short.
-- Do not reveal internal reasoning or thinking."""),
-        MessagesPlaceholder(variable_name="chat_history", optional=True),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
+- Do not reveal internal reasoning or thinking."""
 
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    return AgentExecutor(agent=agent, tools=tools, verbose=False)
+    return create_react_agent(
+        model=get_llm(),
+        tools=tools,
+        prompt=system_prompt
+    )
 
 
 # =========================
@@ -203,6 +192,24 @@ class UserQuery(BaseModel):
 
 
 # =========================
+# EXTRACT TEXT
+# =========================
+
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts).strip()
+    return str(content)
+
+
+# =========================
 # CHAT API
 # =========================
 
@@ -210,13 +217,19 @@ class UserQuery(BaseModel):
 def chat(request: UserQuery):
     try:
         if not os.getenv("GEMINI_API_KEY"):
-            return {"response": "Error: GEMINI_API_KEY environment variable is not set."}
+            return {"response": "Error: GEMINI_API_KEY environment variable is not configured on the server."}
 
-        executor = get_agent_executor()
-        result = executor.invoke({"input": request.query})
-        output = result.get("output", "Sorry, I could not generate a response.")
+        agent = get_agent()
+        result = agent.invoke({
+            "messages": [{"role": "user", "content": request.query}]
+        })
 
-        return {"response": str(output).strip()}
+        messages = result.get("messages", [])
+        if not messages:
+            return {"response": "Sorry, I could not generate a response."}
+
+        answer = extract_text(messages[-1].content)
+        return {"response": answer or "No response generated."}
 
     except Exception as e:
         return {"response": f"Error: {str(e)}"}
@@ -292,10 +305,6 @@ document.getElementById("message").addEventListener("keydown", (e) => {
 def health():
     return {"status": "healthy"}
 
-
-# =========================
-# LOCAL & RENDER RUNNER
-# =========================
 
 if __name__ == "__main__":
     import uvicorn
