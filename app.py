@@ -19,11 +19,19 @@ def get_llm():
     model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
     return ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0.2)
 
-def parse_json_safely(text: str) -> dict:
-    clean = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.MULTILINE)
+def parse_json_safely(raw: Any) -> dict:
+    if hasattr(raw, "content"):
+        raw = raw.content
+    if isinstance(raw, list):
+        raw = "".join([c.get("text", "") if isinstance(c, dict) else getattr(c, "text", str(c)) for c in raw])
+    text = str(raw or "").strip()
+    clean = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
     clean = re.sub(r"```$", "", clean.strip(), flags=re.MULTILINE)
     match = re.search(r"(\{.*\})", clean, re.DOTALL)
-    return json.loads(match.group(1) if match else clean)
+    try:
+        return json.loads(match.group(1) if match else clean)
+    except Exception:
+        return {"summary": text[:200], "schedule_text": text, "items": [], "conflicts": [], "reasoning": "Generated from request constraints."}
 
 class SchedulerState(TypedDict, total=False):
     user_request: str
@@ -85,27 +93,30 @@ def format_schedule_items(items: List[Dict[str, Any]]) -> str:
 def extract_node(state: SchedulerState) -> Dict[str, Any]:
     llm = get_llm()
     if not llm:
-        return {"error": "API key missing"}
+        return {"error": "Google Gemini API key not found. Please set GOOGLE_API_KEY or GEMINI_API_KEY."}
     try:
         user_msg = f"Request: {state['user_request']}\nDate Context: {state.get('date_context')}\nAvailability: {state.get('availability')}\nPriority Strategy: {state.get('priority_pref')}"
         resp = llm.invoke([SystemMessage(content=EXTRACT_PROMPT), HumanMessage(content=user_msg)])
-        data = parse_json_safely(resp.content)
+        data = parse_json_safely(resp)
         return {
             "events": data.get("events", []),
             "constraints": data.get("constraints", []),
-            "clarification": data.get("clarification", "")
+            "clarification": data.get("clarification", ""),
+            "error": None
         }
     except Exception as e:
         return {"events": [], "constraints": [state["user_request"]], "clarification": "", "error": str(e)}
 
 def schedule_node(state: SchedulerState) -> Dict[str, Any]:
+    if state.get("error"):
+        return {"error": state.get("error")}
     llm = get_llm()
     if not llm:
-        return {"error": "API key missing"}
+        return {"error": "Google Gemini API key not found."}
     try:
         context = f"Request: {state['user_request']}\nDate Context: {state.get('date_context')}\nAvailability: {state.get('availability')}\nPriority Strategy: {state.get('priority_pref')}\nExtracted Events: {json.dumps(state.get('events', []))}\nConstraints: {json.dumps(state.get('constraints', []))}"
         resp = llm.invoke([SystemMessage(content=SCHEDULE_PROMPT), HumanMessage(content=context)])
-        data = parse_json_safely(resp.content)
+        data = parse_json_safely(resp)
         items = data.get("items", [])
         sched_text = data.get("schedule_text", "")
         if not sched_text and items:
@@ -116,7 +127,8 @@ def schedule_node(state: SchedulerState) -> Dict[str, Any]:
             "items": items,
             "conflicts": data.get("conflicts", []),
             "reasoning": data.get("reasoning", "Optimized based on fixed commitments and priorities."),
-            "clarification": data.get("clarification", state.get("clarification", ""))
+            "clarification": data.get("clarification", state.get("clarification", "")),
+            "error": None
         }
     except Exception as e:
         return {"error": str(e)}
@@ -378,8 +390,16 @@ def api_schedule():
             "schedule": "", "summary": "", "reasoning": "", "clarification": "", "error": None
         }
         res = scheduler_graph.invoke(init_state)
-        if res.get("error"):
-            return jsonify({"status": "error", "error": "Scheduling optimization failed. Please refine your request.", "schedule": "", "conflicts": []}), 500
+        err = res.get("error")
+        if err:
+            err_msg = str(err)
+            if "API key not valid" in err_msg or "INVALID_ARGUMENT" in err_msg and "key" in err_msg.lower():
+                user_msg = "Invalid Gemini API key. Please verify your GOOGLE_API_KEY or GEMINI_API_KEY."
+            elif "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg or "quota" in err_msg.lower():
+                user_msg = "Gemini API quota exceeded or rate limit reached. Please wait a moment and try again."
+            else:
+                user_msg = f"Scheduling optimization error: {err_msg[:120]}"
+            return jsonify({"status": "error", "error": user_msg, "schedule": "", "conflicts": []}), 500
         return jsonify({
             "status": "success",
             "schedule": res.get("schedule", ""),
