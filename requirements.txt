@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+requests==2.32.4
+pydantic
+langchain-core
+langchain-google-genai
+langchain
+langchain-chroma
+chromadb
