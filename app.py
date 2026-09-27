@@ -17,7 +17,7 @@ def get_llm(model_override: Optional[str] = None):
     if not key:
         return None
     model = model_override or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    return ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0.2)
+    return ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0.2, thinking_budget=0)
 
 def invoke_llm_safely(llm, messages):
     try:
@@ -27,7 +27,7 @@ def invoke_llm_safely(llm, messages):
             alt_model = "gemini-flash-latest" if getattr(llm, "model", "") != "gemini-flash-latest" else "gemini-2.5-flash"
             key = get_api_key()
             if key:
-                alt_llm = ChatGoogleGenerativeAI(model=alt_model, google_api_key=key, temperature=0.2)
+                alt_llm = ChatGoogleGenerativeAI(model=alt_model, google_api_key=key, temperature=0.2, thinking_budget=0)
                 return alt_llm.invoke(messages)
         raise e
 
@@ -58,38 +58,29 @@ class SchedulerState(TypedDict, total=False):
     summary: str
     reasoning: str
     clarification: str
+    final_response: Dict[str, Any]
     error: Optional[str]
 
-EXTRACT_PROMPT = """You are the Entity & Constraint Extraction Engine for AI Scheduler.
-Analyze the user's scheduling request and parameters.
-Rules:
-1. FIXED EVENTS: Cannot move (classes, exams, meetings, appointments, flights). Extract exact or stated times.
-2. FLEXIBLE TASKS: Can move (studying, exercise, project work, reading, personal chores). Extract duration and preferred time windows.
-3. DEADLINES: Identify deadlines (e.g. 'submit before Friday') that require preparatory work sessions.
-4. RECURRENCE: Understand daily, weekdays, weekends, weekly patterns.
-5. TIME WINDOWS: Interpret morning, afternoon, evening, night, early morning, after lunch, before class, after work.
-6. CONSTRAINTS: Extract user availability bounds and stated preferences.
-7. AMBIGUITY: If critical info is ambiguous, provide a short clarification question.
-Return ONLY valid JSON (no markdown fences):
-{"events": [{"name": "...", "type": "fixed|flexible", "start": "...", "end": "...", "duration": "...", "priority": "High|Medium|Low", "deadline": "...", "recurrence": "...", "preferred_time": "..."}], "constraints": ["..."], "clarification": "..."}"""
-
-SCHEDULE_PROMPT = """You are the Schedule Generation, Conflict Detection & Optimization Engine for AI Scheduler.
-Rules:
-1. PRESERVE FIXED EVENTS: Never move or drop fixed events (classes, exams, meetings, appointments).
-2. CONFLICT DETECTION: Identify overlaps (e.g., 10:00-11:00 Meeting vs 10:30-12:00 Gym). In 'conflicts', record conflicting_events, exact reason, and suggested alternatives. Never silently drop events.
-3. DEADLINES: For tasks with deadlines (e.g. 'Finish project before Friday'), distribute preparatory focus sessions leading up to the deadline instead of merely placing an event at the deadline.
-4. FLEXIBLE PLACEMENT: Place flexible tasks into free slots respecting priority (High first), preferred times, and user availability.
-5. PACING: Insert realistic 10-15 min breaks between demanding blocks; avoid unrealistic back-to-back schedules.
+SCHEDULER_PROMPT = """You are the AI Scheduler Engine orchestrating task extraction, constraint analysis, conflict detection, and schedule optimization.
+Execute the full scheduling pipeline:
+1. FIXED EVENTS: Cannot move (classes, exams, meetings, appointments, flights). Preserve exact or stated times.
+2. FLEXIBLE TASKS: Can move (studying, exercise, project work, reading, routines). Schedule in available windows.
+3. CONFLICT DETECTION: Detect overlaps (e.g., 10:00-11:00 Meeting vs 10:30-12:00 Gym). If any events overlap a fixed event or another commitment, record them in 'conflicts' with conflicting_events, exact reason, and suggested alternatives. Never silently drop or move fixed events.
+4. DEADLINES: When a task has a deadline (e.g. 'Finish project before Friday'), distribute preparatory work sessions across the days leading up to the deadline instead of just scheduling a single deadline event.
+5. OPTIMIZATION: Fit flexible tasks into open slots respecting priority (High first), preferred times, and user availability. Add 10-15m realistic breaks between intense blocks.
 6. TRANSPARENCY: Provide a concise summary and reasoning explaining scheduling choices.
-7. LIMITATION: You are an intelligent schedule planner only; do not claim calendar sync or notification sending.
+7. LIMITATION: You are an intelligent schedule planner only; do not claim calendar sync or notification capabilities.
+
 Return ONLY valid JSON (no markdown fences):
 {
-  "summary": "1-2 sentence overview",
+  "events": [{"name": "...", "type": "fixed|flexible", "start": "...", "end": "...", "duration": "...", "priority": "High|Medium|Low"}],
+  "constraints": ["..."],
+  "summary": "1-2 sentence overview of the schedule plan",
   "schedule_text": "Structured text schedule with headers, times, tasks, priority, and status",
   "items": [{"day": "...", "time": "HH:MM - HH:MM", "task": "...", "type": "Fixed|Flexible|Break|Deadline", "priority": "High|Medium|Low", "status": "Scheduled|Conflict|Needs clarification", "notes": "..."}],
   "conflicts": [{"conflicting_events": "...", "reason": "...", "suggestion": "..."}],
   "reasoning": "Explanation for key scheduling choices",
-  "clarification": "..."
+  "clarification": "Concise question if essential info is ambiguous, else empty"
 }"""
 
 def format_schedule_items(items: List[Dict[str, Any]]) -> str:
@@ -102,55 +93,60 @@ def format_schedule_items(items: List[Dict[str, Any]]) -> str:
         lines.append(f"{it.get('time', '')} | {it.get('task', '')} [{it.get('type', 'Task')}] - Priority: {it.get('priority', 'Medium')} ({it.get('status', 'Scheduled')})")
     return "\n".join(lines).strip()
 
-def extract_node(state: SchedulerState) -> Dict[str, Any]:
+def reason_and_schedule_node(state: SchedulerState) -> Dict[str, Any]:
     llm = get_llm()
     if not llm:
         return {"error": "Google Gemini API key not found. Please set GOOGLE_API_KEY or GEMINI_API_KEY."}
     try:
         user_msg = f"Request: {state['user_request']}\nDate Context: {state.get('date_context')}\nAvailability: {state.get('availability')}\nPriority Strategy: {state.get('priority_pref')}"
-        resp = invoke_llm_safely(llm, [SystemMessage(content=EXTRACT_PROMPT), HumanMessage(content=user_msg)])
-        data = parse_json_safely(resp)
-        return {
-            "events": data.get("events", []),
-            "constraints": data.get("constraints", []),
-            "clarification": data.get("clarification", ""),
-            "error": None
-        }
-    except Exception as e:
-        return {"events": [], "constraints": [state["user_request"]], "clarification": "", "error": str(e)}
-
-def schedule_node(state: SchedulerState) -> Dict[str, Any]:
-    if state.get("error"):
-        return {"error": state.get("error")}
-    llm = get_llm()
-    if not llm:
-        return {"error": "Google Gemini API key not found."}
-    try:
-        context = f"Request: {state['user_request']}\nDate Context: {state.get('date_context')}\nAvailability: {state.get('availability')}\nPriority Strategy: {state.get('priority_pref')}\nExtracted Events: {json.dumps(state.get('events', []))}\nConstraints: {json.dumps(state.get('constraints', []))}"
-        resp = invoke_llm_safely(llm, [SystemMessage(content=SCHEDULE_PROMPT), HumanMessage(content=context)])
+        resp = invoke_llm_safely(llm, [SystemMessage(content=SCHEDULER_PROMPT), HumanMessage(content=user_msg)])
         data = parse_json_safely(resp)
         items = data.get("items", [])
         sched_text = data.get("schedule_text", "")
         if not sched_text and items:
             sched_text = format_schedule_items(items)
         return {
-            "summary": data.get("summary", "Schedule organized successfully."),
-            "schedule": sched_text,
+            "events": data.get("events", []),
+            "constraints": data.get("constraints", []),
             "items": items,
+            "schedule": sched_text,
             "conflicts": data.get("conflicts", []),
+            "summary": data.get("summary", "Schedule organized successfully."),
             "reasoning": data.get("reasoning", "Optimized based on fixed commitments and priorities."),
-            "clarification": data.get("clarification", state.get("clarification", "")),
+            "clarification": data.get("clarification", ""),
             "error": None
         }
     except Exception as e:
         return {"error": str(e)}
 
+def optimize_and_finalize_node(state: SchedulerState) -> Dict[str, Any]:
+    if state.get("error"):
+        return {"error": state.get("error")}
+    items = state.get("items", [])
+    schedule_text = state.get("schedule", "")
+    if not schedule_text and items:
+        schedule_text = format_schedule_items(items)
+    final_resp = {
+        "status": "success",
+        "schedule": schedule_text,
+        "items": items,
+        "conflicts": state.get("conflicts", []),
+        "summary": state.get("summary", "Schedule organized successfully."),
+        "reasoning": state.get("reasoning", "Optimized based on fixed commitments and priorities."),
+        "clarification": state.get("clarification", "")
+    }
+    return {
+        "schedule": schedule_text,
+        "final_response": final_resp,
+        "error": None
+    }
+
 workflow = StateGraph(SchedulerState)
-workflow.add_node("extract_constraints", extract_node)
-workflow.add_node("build_schedule", schedule_node)
-workflow.set_entry_point("extract_constraints")
-workflow.add_edge("extract_constraints", "build_schedule")
-workflow.add_edge("build_schedule", END)
+workflow.add_node("reason_and_schedule", reason_and_schedule_node)
+workflow.add_node("optimize_and_finalize", optimize_and_finalize_node)
+workflow.set_entry_point("reason_and_schedule")
+workflow.add_edge("reason_and_schedule", "optimize_and_finalize")
+workflow.add_edge("optimize_and_finalize", END)
 scheduler_graph = workflow.compile()
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -305,7 +301,20 @@ async function generateSchedule(){
         priority: document.getElementById('priority').value
       })
     });
-    const data = await res.json();
+    let data;
+    const cType = res.headers.get('content-type') || '';
+    if (cType.includes('application/json')) {
+      data = await res.json();
+    } else {
+      const txt = await res.text();
+      if (res.status === 504 || txt.includes('504')) {
+        throw new Error('Request timed out (504). Please try again.');
+      } else if (res.status === 502 || txt.includes('502')) {
+        throw new Error('Server starting or connection issue (502). Please try again shortly.');
+      } else {
+        throw new Error(`Server returned HTTP ${res.status}. Please check server logs.`);
+      }
+    }
     if(!res.ok || data.status === 'error'){
       throw new Error(data.error || 'Failed to generate schedule.');
     }
@@ -399,7 +408,7 @@ def api_schedule():
             "availability": str(data.get("availability") or "").strip(),
             "priority_pref": str(data.get("priority") or "Balanced").strip(),
             "events": [], "constraints": [], "conflicts": [], "items": [],
-            "schedule": "", "summary": "", "reasoning": "", "clarification": "", "error": None
+            "schedule": "", "summary": "", "reasoning": "", "clarification": "", "final_response": {}, "error": None
         }
         res = scheduler_graph.invoke(init_state)
         err = res.get("error")
@@ -412,14 +421,15 @@ def api_schedule():
             else:
                 user_msg = f"Scheduling optimization error: {err_msg[:120]}"
             return jsonify({"status": "error", "error": user_msg, "schedule": "", "conflicts": []}), 500
+        final_data = res.get("final_response") or {}
         return jsonify({
             "status": "success",
-            "schedule": res.get("schedule", ""),
-            "conflicts": res.get("conflicts", []),
-            "items": res.get("items", []),
-            "summary": res.get("summary", ""),
-            "reasoning": res.get("reasoning", ""),
-            "clarification": res.get("clarification", "")
+            "schedule": final_data.get("schedule", res.get("schedule", "")),
+            "conflicts": final_data.get("conflicts", res.get("conflicts", [])),
+            "items": final_data.get("items", res.get("items", [])),
+            "summary": final_data.get("summary", res.get("summary", "")),
+            "reasoning": final_data.get("reasoning", res.get("reasoning", "")),
+            "clarification": final_data.get("clarification", res.get("clarification", ""))
         })
     except Exception:
         return jsonify({"status": "error", "error": "Internal scheduling service error.", "schedule": "", "conflicts": []}), 500
