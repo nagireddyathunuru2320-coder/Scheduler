@@ -12,12 +12,24 @@ app = Flask(__name__)
 def get_api_key() -> Optional[str]:
     return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
-def get_llm():
+def get_llm(model_override: Optional[str] = None):
     key = get_api_key()
     if not key:
         return None
-    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+    model = model_override or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     return ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0.2)
+
+def invoke_llm_safely(llm, messages):
+    try:
+        return llm.invoke(messages)
+    except Exception as e:
+        if "404" in str(e) or "NOT_FOUND" in str(e):
+            alt_model = "gemini-flash-latest" if getattr(llm, "model", "") != "gemini-flash-latest" else "gemini-2.5-flash"
+            key = get_api_key()
+            if key:
+                alt_llm = ChatGoogleGenerativeAI(model=alt_model, google_api_key=key, temperature=0.2)
+                return alt_llm.invoke(messages)
+        raise e
 
 def parse_json_safely(raw: Any) -> dict:
     if hasattr(raw, "content"):
@@ -96,7 +108,7 @@ def extract_node(state: SchedulerState) -> Dict[str, Any]:
         return {"error": "Google Gemini API key not found. Please set GOOGLE_API_KEY or GEMINI_API_KEY."}
     try:
         user_msg = f"Request: {state['user_request']}\nDate Context: {state.get('date_context')}\nAvailability: {state.get('availability')}\nPriority Strategy: {state.get('priority_pref')}"
-        resp = llm.invoke([SystemMessage(content=EXTRACT_PROMPT), HumanMessage(content=user_msg)])
+        resp = invoke_llm_safely(llm, [SystemMessage(content=EXTRACT_PROMPT), HumanMessage(content=user_msg)])
         data = parse_json_safely(resp)
         return {
             "events": data.get("events", []),
@@ -115,7 +127,7 @@ def schedule_node(state: SchedulerState) -> Dict[str, Any]:
         return {"error": "Google Gemini API key not found."}
     try:
         context = f"Request: {state['user_request']}\nDate Context: {state.get('date_context')}\nAvailability: {state.get('availability')}\nPriority Strategy: {state.get('priority_pref')}\nExtracted Events: {json.dumps(state.get('events', []))}\nConstraints: {json.dumps(state.get('constraints', []))}"
-        resp = llm.invoke([SystemMessage(content=SCHEDULE_PROMPT), HumanMessage(content=context)])
+        resp = invoke_llm_safely(llm, [SystemMessage(content=SCHEDULE_PROMPT), HumanMessage(content=context)])
         data = parse_json_safely(resp)
         items = data.get("items", [])
         sched_text = data.get("schedule_text", "")
